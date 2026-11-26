@@ -45,3 +45,6 @@ Precision, recall, F1, ROC-AUC, PR-AUC, accuracy, and computing time.
 
 ## Results
 Pending completion of the Databricks experiment.
+
+## Hardware
+To be completed using the actual Databricks compute specifications.
