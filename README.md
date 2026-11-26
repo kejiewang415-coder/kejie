@@ -1,163 +1,291 @@
-{
- "cells": [
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": "# Predicting Late Responses to Consumer Financial Complaints\n**Author:** Kejie Wang \u2014 **Platform:** Databricks / PySpark ML\n\nResearch question: Can complaint information available at submission predict a late company response?\nTarget: `Timely response?`: No = 1 (late), Yes = 0 (timely).\n\nSource: https://www.consumerfinance.gov/data-research/consumer-complaints/\nDownload: https://files.consumerfinance.gov/ccdb/complaints.csv.zip\nUploaded snapshot: `complaints.csv`, **5,626,886,348 bytes**, 5.63 GB / 5.24 GiB uncompressed.\nThe ZIP itself is 356,704,969 bytes. A fresh download may differ; retain your snapshot.\n\n**Before starting:** obtain the instructor's topic approval, as required by the rubric.\nNo model results are prefilled. All tables below are computed when the notebook runs.\n",
-   "id": "complaints-000"
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": "## 1. Set up Databricks\n1. Extract `complaints.csv.zip` on your computer.\n2. In Databricks, upload **complaints.csv** to a Unity Catalog Volume that you can read and write.\n3. Import this `.ipynb` into Workspace and attach compute that supports Spark ML training.\n4. Edit the three `/Volumes/...` paths below, then run the cells in order.\n5. Fill in actual compute details. Do not report the example placeholders as hardware specifications.\n\nThe default uses the **entire dataset**. Eight tuning experiments (four algorithms \u00d7 two tuning methods)\ncan take substantial time. Use `QUICK_RUN=True` only to check the workflow, then set it back to False\nand rerun all cells for the final experiment. Record the actual row counts and sampling setting.\n",
-   "id": "complaints-001"
-  },
-  {
-   "cell_type": "code",
-   "metadata": {},
-   "source": "# EDIT THESE VALUES. Use an existing writable Unity Catalog Volume.\nDATA_PATH = \"/Volumes/YOUR_CATALOG/YOUR_SCHEMA/YOUR_VOLUME/complaints.csv\"\nOUTPUT_BASE = \"/Volumes/YOUR_CATALOG/YOUR_SCHEMA/YOUR_VOLUME/complaints_project\"\nSPARKML_TEMP_DFS_PATH = \"/Volumes/YOUR_CATALOG/YOUR_SCHEMA/YOUR_VOLUME/sparkml_temp\"\nCOMPUTE_DETAILS = {\n    \"compute_type\": \"FILL IN: classic or serverless\",\n    \"runtime\": \"FILL IN: Databricks runtime\",\n    \"driver_type\": \"FILL IN or unavailable\",\n    \"worker_type\": \"FILL IN or unavailable\",\n    \"worker_count\": \"FILL IN or managed by serverless\",\n    \"total_worker_cores\": \"FILL IN or unavailable\",\n    \"worker_memory\": \"FILL IN or unavailable\",\n}\nQUICK_RUN = False\nQUICK_FRACTION = 0.02\nSEED = 42\nNUM_FOLDS = 3\nHASH_DIMENSIONS = 512\nPFI_MAX_ROWS = 10000\nPFI_REPEATS = 3\n\nimport os\nassert \"YOUR_\" not in DATA_PATH + OUTPUT_BASE + SPARKML_TEMP_DFS_PATH, \"Edit the Volume paths first.\"\n# Set before Spark ML imports/tuning, including on shared/serverless compute.\nos.environ[\"SPARKML_TEMP_DFS_PATH\"] = SPARKML_TEMP_DFS_PATH\nos.makedirs(SPARKML_TEMP_DFS_PATH, exist_ok=True)\nos.makedirs(OUTPUT_BASE, exist_ok=True)\n",
-   "execution_count": null,
-   "outputs": [],
-   "id": "complaints-002"
-  },
-  {
-   "cell_type": "code",
-   "metadata": {},
-   "source": "import json, time, platform, uuid, random, statistics\nfrom datetime import datetime, timezone\nfrom pathlib import Path\nimport pandas as pd\nfrom pyspark.sql import functions as F, types as T\nfrom pyspark.ml import Pipeline\nfrom pyspark.ml.feature import FeatureHasher\nfrom pyspark.ml.classification import (\n    LogisticRegression, DecisionTreeClassifier, RandomForestClassifier, GBTClassifier\n)\nfrom pyspark.ml.evaluation import BinaryClassificationEvaluator\nfrom pyspark.ml.tuning import CrossValidator, TrainValidationSplit, ParamGridBuilder\n\nRUN_ID = datetime.now(timezone.utc).strftime(\"%Y%m%dT%H%M%SZ\") + \"_\" + uuid.uuid4().hex[:6]\nRUN_DIR = Path(OUTPUT_BASE) / RUN_ID\nRUN_DIR.mkdir(parents=True, exist_ok=False)\nmetadata = {\n    \"run_id\": RUN_ID, \"spark_version\": spark.version,\n    \"python_version\": platform.python_version(),\n    \"driver_visible_cpu_count_not_cluster_total\": os.cpu_count(),\n    \"hardware\": COMPUTE_DETAILS, \"data_path\": DATA_PATH,\n    \"actual_csv_bytes\": os.path.getsize(DATA_PATH),\n    \"quick_run\": QUICK_RUN, \"quick_fraction\": QUICK_FRACTION if QUICK_RUN else 1.0,\n    \"seed\": SEED, \"folds\": NUM_FOLDS, \"hash_dimensions\": HASH_DIMENSIONS,\n    \"source_url\": \"https://www.consumerfinance.gov/data-research/consumer-complaints/\",\n}\nprint(json.dumps(metadata, indent=2))\n",
-   "execution_count": null,
-   "outputs": [],
-   "id": "complaints-003"
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": "## 2. Load and audit the data\nUse an explicit string schema and fail on malformed records. The CSV must be extracted first;\nSpark's CSV reader is not pointed at a ZIP archive. Missing or invalid target values are excluded,\nnever converted to timely responses. Complaint IDs must be present and unique.\n",
-   "id": "complaints-004"
-  },
-  {
-   "cell_type": "code",
-   "metadata": {},
-   "source": "columns = [\"Date received\", \"Product\", \"Sub-product\", \"Issue\", \"Sub-issue\",\n           \"Company public response\", \"Company\", \"State\", \"ZIP code\", \"Tags\",\n           \"Submitted via\", \"Date sent to company\", \"Company response to consumer\",\n           \"Timely response?\", \"Complaint ID\"]\nschema = T.StructType([T.StructField(c, T.StringType(), True) for c in columns])\nstart = time.perf_counter()\nraw = (spark.read.schema(schema).option(\"header\", True).option(\"enforceSchema\", False)\n       .option(\"mode\", \"FAILFAST\").option(\"multiLine\", True).csv(DATA_PATH))\n# multiLine safely handles quoted newlines but may limit parallel CSV ingestion.\nraw_count = raw.count()\nprint(\"Raw rows:\", raw_count, \"Load/count seconds:\", time.perf_counter() - start)\nraw.groupBy(\"Timely response?\").count().orderBy(F.desc(\"count\")).show(truncate=False)\nid_audit = raw.agg(F.countDistinct(\"Complaint ID\").alias(\"unique_ids\"),\n                  F.sum(F.when(F.col(\"Complaint ID\").isNull() |\n                               (F.trim(F.col(\"Complaint ID\")) == \"\"), 1).otherwise(0)).alias(\"missing_ids\")).first()\nassert id_audit.missing_ids == 0 and id_audit.unique_ids == raw_count, \"Investigate duplicate/missing IDs first.\"\n",
-   "execution_count": null,
-   "outputs": [],
-   "id": "complaints-005"
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": "## 3. Submission-time features and reproducible splits\nExclude response outcomes, dispatch date, ZIP code, tags, and complaint ID from model inputs.\nCompany identifies the complaint recipient; product/issue and submission channel describe the filing.\nThe ID is used only for reproducible splitting. Parse dates with a tolerant cast.\n\nHash original categorical columns into 512 dimensions. Hashing needs no fitted vocabulary and handles\nunseen categories, but collisions may reduce accuracy. All four models use the same representation.\nInterpret original columns with permutation importance rather than treating hash bins as named features.\n\nUse approximately 70% for training/tuning, 15% for model selection, and 15% for final testing.\nThis random holdout estimates performance on similar complaints; it does not establish future-year\nperformance. A future extension should use a chronological test period and time-aware tuning.\n",
-   "id": "complaints-006"
-  },
-  {
-   "cell_type": "code",
-   "metadata": {},
-   "source": "target = F.lower(F.trim(F.col(\"Timely response?\")))\nvalid = raw.where(target.isin(\"yes\", \"no\")).withColumn(\"label\", (target == \"no\").cast(\"double\"))\nbase = valid.select(\n    F.col(\"Complaint ID\").alias(\"complaint_id\"), \"label\",\n    F.col(\"Product\").alias(\"product\"), F.col(\"Sub-product\").alias(\"sub_product\"),\n    F.col(\"Issue\").alias(\"issue\"), F.col(\"Sub-issue\").alias(\"sub_issue\"),\n    F.col(\"Company\").alias(\"company\"), F.col(\"State\").alias(\"state\"),\n    F.col(\"Submitted via\").alias(\"submitted_via\"),\n    F.expr(\"try_cast(`Date received` AS DATE)\").alias(\"received_date\")\n)\nfor name, expr in [(\"received_year\", F.year(\"received_date\")),\n                   (\"received_month\", F.month(\"received_date\")),\n                   (\"received_weekday\", F.dayofweek(\"received_date\"))]:\n    base = base.withColumn(name, expr.cast(\"string\"))\nFEATURES = [\"product\", \"sub_product\", \"issue\", \"sub_issue\", \"company\", \"state\",\n            \"submitted_via\", \"received_year\", \"received_month\", \"received_weekday\"]\nfor c in FEATURES:\n    base = base.withColumn(c, F.when(F.col(c).isNull() | (F.trim(F.col(c)) == \"\"),\n                                    F.lit(\"__MISSING__\")).otherwise(F.col(c)))\nbase = base.select(\"complaint_id\", \"label\", *FEATURES)\nif QUICK_RUN:\n    base = base.sample(False, QUICK_FRACTION, seed=SEED)\nbase = base.withColumn(\"split_bucket\", F.pmod(F.xxhash64(\"complaint_id\", F.lit(SEED)), F.lit(10000)))\ntrain = base.where(\"split_bucket < 7000\").drop(\"split_bucket\")\nselection = base.where(\"split_bucket >= 7000 AND split_bucket < 8500\").drop(\"split_bucket\")\ntest = base.where(\"split_bucket >= 8500\").drop(\"split_bucket\")\nsplit_rows = []\nfor name, frame in [(\"train\", train), (\"selection\", selection), (\"test\", test)]:\n    counts = {int(r.label): r['count'] for r in frame.groupBy(\"label\").count().collect()}\n    assert counts.get(0, 0) >= 20 and counts.get(1, 0) >= 20, \"Too few examples of either class; increase data.\"\n    split_rows.append({\"split\": name, \"rows\": sum(counts.values()),\n                       \"timely\": counts[0], \"late\": counts[1],\n                       \"late_rate\": counts[1] / sum(counts.values())})\nsplit_table = pd.DataFrame(split_rows)\ndisplay(split_table)\nmetadata.update({\"raw_rows\": raw_count, \"splits\": split_rows})\nsplit_table.to_csv(RUN_DIR / \"split_counts.csv\", index=False)\n",
-   "execution_count": null,
-   "outputs": [],
-   "id": "complaints-007"
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": "## 4. Metrics and baselines\nLate response is the positive class. Tune by area under the precision-recall curve (PR-AUC).\nReport **positive-class** precision, recall and F1, together with accuracy, ROC-AUC and PR-AUC.\nPrecision/recall use the models' default decision thresholds; no threshold is adjusted on the test set.\nClass weights and resampling are not used in this baseline experiment.\n\nA model predicting every complaint as timely has zero late-response recall. A constant ranking's\nPR-AUC equals prevalence and ROC-AUC is 0.5 when both classes exist. Spark computes curve areas;\nPR-AUC here should not be described as average precision from a different library.\n",
-   "id": "complaints-008"
-  },
-  {
-   "cell_type": "code",
-   "metadata": {},
-   "source": "pr_evaluator = BinaryClassificationEvaluator(labelCol=\"label\", rawPredictionCol=\"rawPrediction\",\n                                             metricName=\"areaUnderPR\")\nroc_evaluator = BinaryClassificationEvaluator(labelCol=\"label\", rawPredictionCol=\"rawPrediction\",\n                                              metricName=\"areaUnderROC\")\ndef evaluate_predictions(pred):\n    r = pred.agg(\n        F.sum(F.when((F.col(\"label\") == 1) & (F.col(\"prediction\") == 1), 1).otherwise(0)).alias(\"tp\"),\n        F.sum(F.when((F.col(\"label\") == 0) & (F.col(\"prediction\") == 1), 1).otherwise(0)).alias(\"fp\"),\n        F.sum(F.when((F.col(\"label\") == 1) & (F.col(\"prediction\") == 0), 1).otherwise(0)).alias(\"fn\"),\n        F.sum(F.when((F.col(\"label\") == 0) & (F.col(\"prediction\") == 0), 1).otherwise(0)).alias(\"tn\")\n    ).first().asDict()\n    tp, fp, fn, tn = [r[k] for k in [\"tp\", \"fp\", \"fn\", \"tn\"]]\n    precision = tp / (tp + fp) if tp + fp else 0.0\n    recall = tp / (tp + fn) if tp + fn else 0.0\n    return dict(r, accuracy=(tp+tn)/(tp+fp+fn+tn), late_precision=precision,\n                late_recall=recall, late_f1=2*precision*recall/(precision+recall) if precision+recall else 0.0,\n                roc_auc=roc_evaluator.evaluate(pred), pr_auc=pr_evaluator.evaluate(pred))\nbaseline = [{\"split\": r[\"split\"], \"all_timely_accuracy\": 1-r[\"late_rate\"],\n             \"all_timely_late_recall\": 0.0, \"constant_score_pr_auc\": r[\"late_rate\"],\n             \"constant_score_roc_auc\": 0.5} for r in split_rows]\ndisplay(pd.DataFrame(baseline))\n",
-   "execution_count": null,
-   "outputs": [],
-   "id": "complaints-009"
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": "## 5. Four algorithms, each tuned with both required methods\nRun three-fold CrossValidator **and** TrainValidationSplit for every algorithm (eight experiments).\nBoth methods receive only the training split and use the same candidate grids.\nEach selected configuration is refitted on the full training split by Spark's tuner.\n\n`fit_seconds_including_refit` includes the entire tuning process and its automatic refit.\nThe separately timed refit measures one training run with the chosen parameters; it is **not added**\nto tuning time. Selection scoring time includes input reads, feature transformation and scoring.\nNo explicit DataFrame caching is used, for compatibility with managed compute. Hardware, shared load,\nand file reads affect all timings. These are end-to-end measurements, not isolated CPU benchmarks.\n",
-   "id": "complaints-010"
-  },
-  {
-   "cell_type": "code",
-   "metadata": {},
-   "source": "def model_specs():\n    lr = LogisticRegression(maxIter=60, standardization=True)\n    dt = DecisionTreeClassifier(seed=SEED, maxBins=32)\n    rf = RandomForestClassifier(seed=SEED, numTrees=40, maxBins=32)\n    gbt = GBTClassifier(seed=SEED, maxIter=25, maxBins=32)\n    return [\n        (\"LogisticRegression\", lr, ParamGridBuilder().addGrid(lr.regParam, [0.001, 0.01]).build()),\n        (\"DecisionTree\", dt, ParamGridBuilder().addGrid(dt.maxDepth, [4, 7]).build()),\n        (\"RandomForest\", rf, ParamGridBuilder().addGrid(rf.maxDepth, [4, 7]).build()),\n        (\"GBT\", gbt, ParamGridBuilder().addGrid(gbt.maxDepth, [3, 5]).build()),\n    ]\n\nexperiments, fitted_models = [], {}\nfor model_name, estimator, grid in model_specs():\n    for method in [\"CrossValidator\", \"TrainValidationSplit\"]:\n        experiment_id = model_name + \"_\" + method\n        hasher = FeatureHasher(inputCols=FEATURES, outputCol=\"features\", numFeatures=HASH_DIMENSIONS)\n        pipeline = Pipeline(stages=[hasher, estimator])\n        common = dict(estimator=pipeline, estimatorParamMaps=grid,\n                      evaluator=pr_evaluator, parallelism=1, seed=SEED, collectSubModels=False)\n        if method == \"CrossValidator\":\n            tuner = CrossValidator(numFolds=NUM_FOLDS, **common)\n        else:\n            tuner = TrainValidationSplit(trainRatio=0.8, **common)\n        print(\"Starting:\", experiment_id, flush=True)\n        started = time.perf_counter()\n        tuned = tuner.fit(train)\n        fit_seconds = time.perf_counter() - started\n        internal_scores = list(tuned.avgMetrics if method == \"CrossValidator\" else tuned.validationMetrics)\n        best_index = max(range(len(internal_scores)), key=lambda i: internal_scores[i])\n        best_params = grid[best_index]\n        params_text = json.dumps({p.name: v for p, v in best_params.items()}, sort_keys=True)\n        started = time.perf_counter()\n        chosen = pipeline.copy(best_params).fit(train)\n        refit_seconds = time.perf_counter() - started\n        started = time.perf_counter()\n        # Aggregating predictions forces model scoring; count() alone can prune prediction work.\n        predictions = chosen.transform(selection)\n        predictions.agg(F.sum(\"prediction\").alias(\"predicted_positive_count\")).collect()\n        scoring_seconds = time.perf_counter() - started\n        metrics = evaluate_predictions(predictions)\n        row = dict(experiment_id=experiment_id, model=model_name, tuning_method=method,\n                   params=params_text, fit_seconds_including_refit=fit_seconds,\n                   single_refit_seconds=refit_seconds, selection_scoring_seconds=scoring_seconds,\n                   internal_validation_pr_auc=float(internal_scores[best_index]),\n                   **{\"selection_\"+k: v for k,v in metrics.items()})\n        experiments.append(row)\n        fitted_models[experiment_id] = chosen\n        # Save after every experiment so completed work remains available if a later fit fails.\n        pd.DataFrame(experiments).to_csv(RUN_DIR / \"selection_comparison.csv\", index=False)\n        print(experiment_id, \"selection PR-AUC:\", metrics[\"pr_auc\"], flush=True)\ncomparison = pd.DataFrame(experiments).sort_values(\"selection_pr_auc\", ascending=False)\ndisplay(comparison)\n",
-   "execution_count": null,
-   "outputs": [],
-   "id": "complaints-011"
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": "## 6. Lock the winner before final testing\nChoose the experiment with highest **selection-set** PR-AUC, using selection F1 and experiment name\nonly to break ties. Do not change this choice after inspecting test results.\nReport every experiment's test results transparently; the best algorithm in the project is the\npreselected winner, even if a different model happens to score higher on the test set.\n",
-   "id": "complaints-012"
-  },
-  {
-   "cell_type": "code",
-   "metadata": {},
-   "source": "ranked = sorted(experiments, key=lambda r: (-r[\"selection_pr_auc\"], -r[\"selection_late_f1\"], r[\"experiment_id\"]))\nWINNER_ID = ranked[0][\"experiment_id\"]\nbest_model = fitted_models[WINNER_ID]\nmetadata[\"selected_experiment\"] = WINNER_ID\nmetadata[\"selection_rule\"] = \"selection PR-AUC descending; selection late F1 descending; experiment ID ascending\"\nprint(\"LOCKED winner:\", WINNER_ID)\nwith open(RUN_DIR / \"run_metadata.json\", \"w\") as f:\n    json.dump(metadata, f, indent=2)\n\ntest_rows = []\nfor row in experiments:\n    chosen = fitted_models[row[\"experiment_id\"]]\n    started = time.perf_counter()\n    pred = chosen.transform(test)\n    pred.agg(F.sum(\"prediction\")).collect()\n    score_seconds = time.perf_counter() - started\n    metrics = evaluate_predictions(pred)\n    test_rows.append(dict(experiment_id=row[\"experiment_id\"], model=row[\"model\"],\n                          tuning_method=row[\"tuning_method\"],\n                          selected_before_test=row[\"experiment_id\"] == WINNER_ID,\n                          fit_seconds_including_refit=row[\"fit_seconds_including_refit\"],\n                          single_refit_seconds=row[\"single_refit_seconds\"],\n                          test_scoring_seconds=score_seconds, **metrics))\ntest_table = pd.DataFrame(test_rows)\ndisplay(test_table)\ntest_table.to_csv(RUN_DIR / \"test_comparison.csv\", index=False)\nprint(\"Selected model's final test result:\")\ndisplay(test_table[test_table.selected_before_test])\n",
-   "execution_count": null,
-   "outputs": [],
-   "id": "complaints-013"
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": "## 7. Permutation feature importance of original columns\nFor the locked winner, compute the drop in PR-AUC after shuffling one original feature group.\nUse a deterministic bounded test sample (at most 10,000 rows) and repeat each shuffle three times.\nOnly these bounded raw rows go to the driver; training and model scoring remain in Spark ML.\nShuffle the date components together so year/month/weekday remain paired.\n\nPositive importance means shuffling hurt performance; negative values may reflect noise.\nCorrelated product/issue features can substitute for each other, reducing individual importance.\nShuffling can produce unusual feature combinations. Importance measures predictive reliance,\nnot a causal effect, and must not be used to retune the model after seeing the test results.\n",
-   "id": "complaints-014"
-  },
-  {
-   "cell_type": "code",
-   "metadata": {},
-   "source": "sample_rows = (test.orderBy(F.xxhash64(\"complaint_id\", F.lit(SEED + 99)))\n               .limit(PFI_MAX_ROWS).collect())\nassert len({r.label for r in sample_rows}) == 2, \"Increase PFI_MAX_ROWS to include both classes.\"\npfi_schema = test.schema\nsample_dicts = [r.asDict() for r in sample_rows]\nsample_df = spark.createDataFrame(sample_rows, schema=pfi_schema)\nbaseline_pr = pr_evaluator.evaluate(best_model.transform(sample_df))\ngroups = {c: [c] for c in FEATURES if not c.startswith(\"received_\")}\ngroups[\"Date received\"] = [\"received_year\", \"received_month\", \"received_weekday\"]\nimportance_rows = []\nfor group_index, (group, cols) in enumerate(groups.items()):\n    drops = []\n    for repeat in range(PFI_REPEATS):\n        order = list(range(len(sample_dicts)))\n        random.Random(SEED + group_index * 100 + repeat).shuffle(order)\n        shuffled = [dict(r) for r in sample_dicts]\n        for i, j in enumerate(order):\n            for col in cols:\n                shuffled[i][col] = sample_dicts[j][col]\n        shuffled_df = spark.createDataFrame(shuffled, schema=pfi_schema)\n        shuffled_pr = pr_evaluator.evaluate(best_model.transform(shuffled_df))\n        drops.append(baseline_pr - shuffled_pr)\n    importance_rows.append(dict(feature=group, mean_pr_auc_drop=statistics.mean(drops),\n                                std_pr_auc_drop=statistics.pstdev(drops),\n                                repeats=PFI_REPEATS, sample_rows=len(sample_rows),\n                                baseline_sample_pr_auc=baseline_pr))\nimportance = pd.DataFrame(importance_rows).sort_values(\"mean_pr_auc_drop\", ascending=False)\ndisplay(importance)\nimportance.to_csv(RUN_DIR / \"permutation_importance.csv\", index=False)\n",
-   "execution_count": null,
-   "outputs": [],
-   "id": "complaints-015"
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": "## 8. Error analysis and measured findings\nCompare the winner's errors across product and submission channel. Show group counts to avoid\ninterpreting a small subgroup as conclusive. These are descriptive test-set results.\n",
-   "id": "complaints-016"
-  },
-  {
-   "cell_type": "code",
-   "metadata": {},
-   "source": "best_predictions = best_model.transform(test)\nfor group in [\"product\", \"submitted_via\"]:\n    breakdown = (best_predictions.groupBy(group).agg(\n        F.count(\"*\").alias(\"rows\"),\n        F.sum(\"label\").alias(\"actual_late\"),\n        F.sum(F.when((F.col(\"label\") == 1) & (F.col(\"prediction\") == 1), 1).otherwise(0)).alias(\"caught_late\"),\n        F.sum(F.when((F.col(\"label\") == 0) & (F.col(\"prediction\") == 1), 1).otherwise(0)).alias(\"false_alerts\"))\n        .withColumn(\"late_recall\", F.when(F.col(\"actual_late\") > 0, F.col(\"caught_late\") / F.col(\"actual_late\")))\n        .orderBy(F.desc(\"rows\")))\n    display(breakdown)\n    breakdown.toPandas().to_csv(RUN_DIR / (group + \"_error_analysis.csv\"), index=False)\n\nwinner_metrics = next(r for r in test_rows if r[\"selected_before_test\"])\ntop_features = \", \".join(importance.head(3).feature.tolist())\nfindings = f\"\"\"# Measured project findings\nSelected experiment: {WINNER_ID}\nSelection criterion: held-out selection PR-AUC.\nFinal test PR-AUC: {winner_metrics['pr_auc']:.6f}\nFinal test ROC-AUC: {winner_metrics['roc_auc']:.6f}\nLate-response precision: {winner_metrics['late_precision']:.6f}\nLate-response recall: {winner_metrics['late_recall']:.6f}\nLate-response F1: {winner_metrics['late_f1']:.6f}\nAccuracy: {winner_metrics['accuracy']:.6f}\nMost influential feature groups on the permutation sample: {top_features}.\nQuick run: {QUICK_RUN}. Use a full-data run for final reported results.\nInterpretation: predictive associations in published complaints, not causal effects or market-wide rates.\n\"\"\"\n(RUN_DIR / \"measured_findings.md\").write_text(findings)\nprint(findings)\nprint(\"Outputs:\", str(RUN_DIR))\n",
-   "execution_count": null,
-   "outputs": [],
-   "id": "complaints-017"
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": "## 9. Optional: save the winning Spark pipeline\nEnable only after the experiment succeeds. A unique run directory prevents overwriting previous runs.\nSome managed environments restrict model persistence; the CSV tables remain the reporting outputs.\n",
-   "id": "complaints-018"
-  },
-  {
-   "cell_type": "code",
-   "metadata": {},
-   "source": "SAVE_MODEL = False\nif SAVE_MODEL:\n    best_model.write().save(str(RUN_DIR / \"best_spark_pipeline\"))\n    print(\"Saved winner pipeline.\")\n",
-   "execution_count": null,
-   "outputs": [],
-   "id": "complaints-019"
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": "## 10. GitHub, slides and term paper checklist\nSuggested repository contents:\n- `README.md`: research question, data source, setup, full-data size, actual compute, measured results, limitations.\n- This executed `.ipynb` notebook, including output tables.\n- `results/`: generated comparison tables, split counts, metadata, importance and findings.\n- Presentation slides with **all text at least 28 pt**, including tables and figures.\n- Term paper with introduction, related work, dataset, methods, experiments, results, limitations and conclusion.\n- `data/README.md`: official download URL, snapshot date, CSV size, extraction and upload instructions.\n  Ask the instructor whether an externally hosted full dataset plus a small sample meets the dataset deliverable.\n\nSlide sequence: title/research question; originality and use case; source and dataset size; class balance;\nsubmission-time features; hardware specifications; four models and tuning; comparison results;\nlocked winner and confusion matrix; permutation importance; error analysis/limitations; conclusion and GitHub/data URLs.\nSplit wide result tables across slides to preserve 28-point text. Never invent hardware or accuracy.\n\nOriginal contribution to emphasize: a reproducible late-response screening experiment with both tuning\nmethods, explicit prevention of outcome leakage, original-column importance and error analysis by filing category.\nThis is an application contribution, not a claim to have invented the algorithms.\n\nLimitations: complaints are a selected population; labels may reflect operational practices; random holdouts\ndo not establish temporal generalization; hashing loses some detail; rare late responses can limit recall;\nfeature importance does not establish causality. Model outputs are an academic screening experiment.\n\nReferences:\n- CFPB data: https://www.consumerfinance.gov/data-research/consumer-complaints/\n- Spark model tuning: https://spark.apache.org/docs/latest/ml-tuning.html\n- Spark FeatureHasher: https://spark.apache.org/docs/latest/api/python/reference/api/pyspark.ml.feature.FeatureHasher.html\n- Spark classification: https://spark.apache.org/docs/latest/ml-classification-regression.html\n\nTroubleshooting:\n- `SPARKML_TEMP_DFS_PATH`: the setup cell sets a writable `/Volumes/...` location before ML imports.\n  If your session previously imported Spark ML before setting it, restart Python and rerun in order.\n- Permission errors: use a Volume and compute mode your Databricks account permits.\n- Missing names: run all cells from the beginning.\n- Long training: use quick mode to verify setup; retain full-data settings for the final experiment.\n- CSV ingestion is slow: multiline CSV parsing can restrict parallelism. After validating your snapshot,\n  convert it once to Delta in your Databricks environment and adapt the loader for subsequent runs.\n",
-   "id": "complaints-020"
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "name": "python",
-   "version": "3"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+# -*- coding: utf-8 -*-
+"""Classification_Pipeline_CV_Tune..ipynb
+
+Automatically generated by Colab.
+
+Original file is located at
+    https://colab.research.google.com/drive/1TZJA8yaSS1E99h8WKPbYKZDuOcT2NbpT
+
+## CIS5560: PySpark Pipeline Classification: Tuning Model Parameters and Cross Validation & Train Split Validation
+
+### Jongwook Woo (jwoo5@calstatela.edu), revised on 04/11/2022, 03/22/2019, 04/08/2018
+Tested in Oracle Big Data cluster (includes Apache Spark 3.x, Python 3.x)
+
+## Creating a Pipeline
+
+In this exercise, you will implement a pipeline that includes multiple stages of *transformers* and *estimators* to prepare features and train a classification model. The resulting trained *PipelineModel* can then be used as a transformer to predict whether or not a flight will be late. And, you will optimise the parameters for a classification model to find out more accurate models. Then, in order to avoid overfit, you adopt Cross Validation and Train Split Validation.
+
+### Import Spark SQL and Spark ML Libraries
+
+First, import the libraries you will need:
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+
+from pyspark.ml import Pipeline
+from pyspark.ml.classification import DecisionTreeClassifier, LogisticRegression
+from pyspark.ml.feature import VectorAssembler, StringIndexer, VectorIndexer, MinMaxScaler
+from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit, CrossValidator
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+
+""" ### Load Source Data
+The data for this exercise is provided as a CSV file containing details of flights. The data includes specific characteristics (or *features*) for each flight, as well as a column indicating how many minutes late or early the flight arrived.
+
+You will load this data into a DataFrame and display it.
+
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+
+# DataFrame Schema, that should be a Table schema by Jongwook Woo (jwoo5@calstatela.edu) 01/07/2016
+flightSchema = StructType([
+  StructField("DayofMonth", IntegerType(), False),
+  StructField("DayOfWeek", IntegerType(), False),
+  StructField("Carrier", StringType(), False),
+  StructField("OriginAirportID", IntegerType(), False),
+  StructField("DestAirportID", IntegerType(), False),
+  StructField("DepDelay", IntegerType(), False),
+  StructField("ArrDelay", IntegerType(), False),
+])
+
+"""### Read csv file from DBFS (Databricks File Systems)
+
+### TODO 1: follow the direction to read your table after upload it to Data at the left frame
+### NOTE: See reference [[1](https://docs.databricks.com/user-guide/tables.html#create-a-table)]
+1. After flights.csv file is added to the data of the left frame, create a table using the UI, especially, "Upload File"
+1. Click "Preview Table to view the table" and Select the option as flights.csv has a header as the first row: "First line is header"
+1. Change the data type of the table columns as shown in flightSchema of the above cell
+1. When you click on create table button, remember the table name, for example, _flights_csv_
+
+### Read csv file from HDFS of Oracle Big Data cluster
+
+### TODO 1: follow the direction to read your data asset not the instructors
+### NOTE: The current code is to read data asset of the instructor
+
+1. flights.csv file is added to the HDFS at the previous week
+1. Need to change the data path to yours, for example, the instructor's HDFS path is as follows:
+
+```
+/user/jwoo5/dataset/flights.csv
+
+```
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+
+# Oracle BDCE
+#csv = spark.read.csv('/user/jwoo5/dataset/flights.csv', inferSchema=True, header=True)
+csv = spark.read.csv('/user/jwoo5/flights.csv', inferSchema=True, header=True)
+
+csv.show(5)
+
+"""### Prepare the Data
+Most modeling begins with exhaustive exploration and preparation of the data. In this example, the data has been cleaned for you. You will simply select a subset of columns to use as *features* and create a Boolean *label* field named **Late** with the value **1** for flights that arrived 15 minutes or more after the scheduled arrival time, or **0** if the flight was early or on-time.
+
+(Note that in a real scenario, you would perform additional tasks such as handling missing or duplicated data, scaling numeric columns, and using a process called *feature engineering* to create new features for your model).
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+data = csv.select("DayofMonth", "DayOfWeek", "Carrier", "OriginAirportID", "DestAirportID", "DepDelay", ((col("ArrDelay") > 15).cast("Double").alias("label")))
+# data = csv
+data.show()
+
+""" ### Split the Data
+It is common practice when building supervised machine learning models to split the source data, using some of it to train the model and reserving some to test the trained model. In this exercise, you will use 70% of the data for training, and reserve 30% for testing. In the testing data, the **label** column is renamed to **trueLabel** so you can use it later to compare predicted labels with known actual values.
+
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+splits = data.randomSplit([0.7, 0.3])
+train = splits[0]
+test = splits[1].withColumnRenamed("label", "trueLabel")
+train_rows = train.count()
+test_rows = test.count()
+print("Training Rows:", train_rows, " Testing Rows:", test_rows)
+
+""" ### Define the Pipeline
+A predictive model often requires multiple stages of feature preparation. For example, it is common when using some algorithms to distingish between continuous features (which have a calculable numeric value) and categorical features (which are numeric representations of discrete categories). It is also common to *normalize* continuous numeric features to use a common scale (for example, by scaling all numbers to a proportinal decimal value between 0 and 1).
+
+A pipeline consists of a a series of *transformer* and *estimator* stages that typically prepare a DataFrame for
+modeling and then train a predictive model. In this case, you will create a pipeline with seven stages:
+- A **StringIndexer** estimator that converts string values to indexes for categorical features
+- A **VectorAssembler** that combines categorical features into a single vector
+- A **VectorIndexer** that creates indexes for a vector of categorical features
+- A **VectorAssembler** that creates a vector of continuous numeric features
+- A **MinMaxScaler** that normalizes continuous numeric features
+- A **VectorAssembler** that creates a vector of categorical and continuous features
+- A **DecisionTreeClassifier** that trains a classification model.
+
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+strIdx = StringIndexer(inputCol = "Carrier", outputCol = "CarrierIdx")
+
+# the following columns are categorical number such as ID so that it should be Category features
+catVect = VectorAssembler(inputCols = ["CarrierIdx", "DayofMonth", "DayOfWeek", "OriginAirportID", "DestAirportID"], outputCol="catFeatures")
+catIdx = VectorIndexer(inputCol = catVect.getOutputCol(), outputCol = "idxCatFeatures")
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+# number is meaningful so that it should be number features
+numVect = VectorAssembler(inputCols = ["DepDelay"], outputCol="numFeatures")
+# number vector is normalized
+minMax = MinMaxScaler(inputCol = numVect.getOutputCol(), outputCol="normFeatures")
+
+featVect = VectorAssembler(inputCols=["idxCatFeatures", "normFeatures"], outputCol="features")  #="features1")
+# number vector is normalized: this changes the accuracy of precision a little
+# minMax2 = MinMaxScaler(inputCol = featVect.getOutputCol(), outputCol="features")
+
+#dt = DecisionTreeClassifier(labelCol="label", featuresCol="features")
+lr = LogisticRegression(labelCol="label",featuresCol="features",maxIter=10,regParam=0.3)
+
+# Pipeline process the series of transformation above, which is 7 transformation
+pipeline = Pipeline(stages=[strIdx, catVect, catIdx, numVect, minMax, featVect, lr]) #minMax2, lr])
+
+"""### Tune Parameters
+You can tune parameters to find the best model for your data. A simple way to do this is to use  **TrainValidationSplit** to evaluate each combination of parameters defined in a **ParameterGrid** against a subset of the training data in order to find the best performing parameters.
+
+#### Regularization
+is a way of avoiding Imbalances in the way that the data is trained against the training data so that the model ends up being over fit to the training data. In other words It works really well with the training data but it doesn't generalize well with other data.
+That we can use a **regularization parameter** to vary the way that the model balances that way.
+
+#### Training ratio of 0.8
+it's going to use 80% of the the data that it's got in its training set to train the model and then the remaining 20% is going to use to validate the trained model.
+
+In **ParamGridBuilder**, all possible combinations are generated from regParam, maxIter, threshold. So it is going to try each combination of the parameters with 80% of the the data to train the model and 20% to to validate it.
+
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+
+paramGrid = (ParamGridBuilder() \
+             .addGrid(lr.regParam, [0.01, 0.5]) \
+             .addGrid(lr.elasticNetParam, [0.0, 0.5]) \
+             .addGrid(lr.maxIter, [1, 5]) \
+             .build())
+
+
+'''paramGrid = ParamGridBuilder() \
+    .addGrid(lr.regParam, [0.01, 0.1, 0.3]) \
+    .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0]) \
+    .addGrid(lr.maxIter, [5, 10]) \
+    .build()'''
+
+'''paramGrid = (ParamGridBuilder() \
+             .addGrid(lr.regParam, [0.01, 0.5, 2.0]) \
+             .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0]) \
+             .addGrid(lr.maxIter, [1, 5, 10]) \
+             .build())
+'''
+
+#paramGrid = ParamGridBuilder().addGrid(lr.regParam, [0.3, 0.1, 0.01]).addGrid(lr.maxIter, [10, 5]).addGrid(lr.threshold, [0.35, 0.30]).build()
+
+"""### CrossValidator vs TrainValidationSplit
+
+In addition to CrossValidator Spark also offers TrainValidationSplit for hyper-parameter tuning. TrainValidationSplit only evaluates each combination of parameters once, as opposed to k times in the case of CrossValidator. It is therefore less expensive, but will not produce as reliable results when the training dataset is not sufficiently large.
+
+Unlike CrossValidator, TrainValidationSplit creates a single (training, test) dataset pair. It splits the dataset into these two parts using the trainRatio parameter. For example with trainRatio=0.75
+
+TrainValidationSplit will generate a training and test dataset pair where 75% of the data is used for training and 25% for validation.
+
+Like CrossValidator, TrainValidationSplit finally fits the Estimator using the best ParamMap and the entire dataset.
+
+**Reference:** https://spark.apache.org/docs/latest/ml-tuning.html
+
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+# TODO: K = 2 you may test it with 5, 10
+# K=3, 5,
+# K= 10 takes too long
+'''
+cv = CrossValidator(estimator=pipeline, evaluator=BinaryClassificationEvaluator(), \
+                    estimatorParamMaps=paramGrid, numFolds=3)
+'''
+cv = TrainValidationSplit(estimator=pipeline, evaluator=BinaryClassificationEvaluator(), estimatorParamMaps=paramGrid, trainRatio=0.8)
+
+model = cv.fit(train)
+
+""" ### Test the Pipeline Model
+The model produced by the pipeline is a transformer that will apply all of the stages in the pipeline to a specified DataFrame and apply the trained model to generate predictions. In this case, you will transform the **test** DataFrame using the pipeline to generate label predictions.
+
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+
+prediction = model.transform(test)
+predicted = prediction.select("features", "prediction", "probability", "trueLabel")
+
+predicted.show(100, truncate=False)
+
+"""The resulting DataFrame is produced by applying all of the transformations in the pipline to the test data. The **prediction** column contains the predicted value for the label, and the **trueLabel** column contains the actual known value from the testing data.
+
+### Compute Confusion Matrix Metrics
+Classifiers are typically evaluated by creating a *confusion matrix*, which indicates the number of:
+- True Positives
+- True Negatives
+- False Positives
+- False Negatives
+
+From these core measures, other evaluation metrics such as *precision* and *recall* can be calculated.
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+
+tp = float(predicted.filter("prediction == 1.0 AND truelabel == 1").count())
+fp = float(predicted.filter("prediction == 1.0 AND truelabel == 0").count())
+tn = float(predicted.filter("prediction == 0.0 AND truelabel == 0").count())
+fn = float(predicted.filter("prediction == 0.0 AND truelabel == 1").count())
+metrics = spark.createDataFrame([
+ ("TP", tp),
+ ("FP", fp),
+ ("TN", tn),
+ ("FN", fn),
+ ("Precision", tp / (tp + fp)),
+ ("Recall", tp / (tp + fn))],["metric", "value"])
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+
+
+metrics.show()
+
+"""### View the Raw Prediction and Probability
+The prediction is based on a raw prediction score that describes a labelled point in a logistic function. This raw prediction is then converted to a predicted label of 0 or 1 based on a probability vector that indicates the confidence for each possible label value (in this case, 0 and 1). The value with the highest confidence is selected as the prediction.
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+prediction.select("rawPrediction", "probability", "prediction", "trueLabel").show(100, truncate=False)
+
+"""Note that there are now more True Positives and less False Negatives, and Recall has improved. By changing the discrimination threshold, the model now gets more predictions correct - though it's worth noting that the number of False Positives has also increased.
+
+### Calculate the update AUC
+
+### Review the Area Under ROC
+Another way to assess the performance of a classification model is to measure the area under a ROC curve for the model. the spark.ml library includes a **BinaryClassificationEvaluator** class that you can use to compute this. The ROC curve shows the True Positive and False Positive rates plotted for varying thresholds.
+If AUC is 0.9227 (=92%), it is very high.
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %pyspark
+
+evaluator = BinaryClassificationEvaluator(labelCol="trueLabel", rawPredictionCol="rawPrediction", metricName="areaUnderROC")
+auc = evaluator.evaluate(prediction)
+print("AUC = ", auc)
+
+"""%pyspark
+
+"""
